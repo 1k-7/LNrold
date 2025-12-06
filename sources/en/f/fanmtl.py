@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import logging
 import time
+import random
 import requests
 from urllib.parse import urlparse, parse_qs 
 from bs4 import BeautifulSoup
@@ -9,7 +10,7 @@ from lncrawl.core.crawler import Crawler
 
 # Import Selenium
 from lncrawl.webdriver.local import create_local
-from selenium.webdriver import ChromeOptions
+from selenium.webdriver import ChromeOptions, ActionChains
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -28,7 +29,6 @@ class FanMTLCrawler(Crawler):
         self.runner = requests.Session()
         
         # 2. MATCH BROWSER HEADERS EXACTLY
-        # This helps 'requests' look like the Selenium browser
         self.runner.headers.update({
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -40,9 +40,6 @@ class FanMTLCrawler(Crawler):
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "same-origin",
             "Sec-Fetch-User": "?1",
-            "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"Linux"',
             "Referer": "https://www.fanmtl.com/"
         })
         
@@ -53,14 +50,26 @@ class FanMTLCrawler(Crawler):
 
         self.scraper = self.runner
         self.cleaner.bad_css.update({'div[align="center"]'})
-        logger.info("FanMTL Strategy: Hybrid (Requests + Selenium Content Fallback)")
+        logger.info("FanMTL Strategy: Hybrid (Requests + Humanized Selenium Fallback)")
+
+    def human_click(self, driver, element):
+        """Moves mouse to element with small jitters before clicking."""
+        try:
+            action = ActionChains(driver)
+            # Move to random offset to look human
+            x_offset = random.randint(-5, 5)
+            y_offset = random.randint(-5, 5)
+            action.move_to_element_with_offset(element, x_offset, y_offset)
+            action.pause(random.uniform(0.1, 0.3))
+            action.click()
+            action.perform()
+        except Exception:
+            # Fallback to JS click if action chain fails
+            driver.execute_script("arguments[0].click();", element)
 
     def fetch_with_browser(self, url):
         """
-        Launches Selenium to:
-        1. Access the URL
-        2. Solve Cloudflare (Click)
-        3. Return the VALID HTML and COOKIES
+        Launches Selenium with a RETRY LOOP to solve Cloudflare.
         """
         logger.warning(f"🔒 Launching Browser Solver for: {url}")
         driver = None
@@ -84,32 +93,46 @@ class FanMTLCrawler(Crawler):
             })
 
             driver.get(url)
-            time.sleep(3)
+            
+            # --- RETRY LOOP FOR SOLVING ---
+            # Attempt to solve up to 3 times if we get stuck
+            for attempt in range(3):
+                time.sleep(3 + attempt) # Wait a bit longer each time
+                
+                # If we are already through, break!
+                if "Just a moment" not in driver.title:
+                    logger.info("Browser: Page loaded successfully!")
+                    break
 
-            # --- CLICKER LOGIC ---
-            try:
-                # Wait for Cloudflare Challenge
-                iframe = WebDriverWait(driver, 5).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "iframe[src*='challenge'], iframe[src*='turnstile']"))
-                )
-                if iframe:
-                    logger.info("Browser: Found challenge iframe. Clicking...")
+                logger.info(f"Browser: Attempting Solve #{attempt+1}...")
+                
+                try:
+                    # Switch to iframe
+                    iframe = WebDriverWait(driver, 5).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "iframe[src*='challenge'], iframe[src*='turnstile']"))
+                    )
                     driver.switch_to.frame(iframe)
+                    
+                    # Find checkbox
                     checkbox = WebDriverWait(driver, 5).until(
                         EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='checkbox'], .mark, body"))
                     )
-                    driver.execute_script("arguments[0].click();", checkbox)
+                    
+                    # Perform Human Click
+                    self.human_click(driver, checkbox)
+                    
+                    # Switch back and wait
                     driver.switch_to.default_content()
                     time.sleep(5)
-            except Exception:
-                # Might trigger if no iframe found (already passed or different block)
-                pass
-            
-            # Wait for redirect if still on challenge page
-            if "Just a moment" in driver.title:
-                logger.info("Browser: Waiting for redirect...")
-                time.sleep(10)
+                except Exception as e:
+                    # If we can't find the frame, maybe we are just waiting for redirect
+                    logger.debug(f"Solver step failed: {e}")
+                    driver.switch_to.default_content()
 
+            # Final check
+            if "Just a moment" in driver.title:
+                logger.error("Browser: Failed to pass challenge after retries.")
+            
             # Grab content and cookies
             html = driver.page_source
             cookies = driver.get_cookies()
@@ -125,9 +148,6 @@ class FanMTLCrawler(Crawler):
                 except: pass
 
     def get_soup_safe(self, url, headers=None):
-        """
-        Tries Requests. If blocked, uses Selenium to get the HTML directly.
-        """
         retries = 0
         while True:
             try:
@@ -152,9 +172,6 @@ class FanMTLCrawler(Crawler):
                                     cookie['name'], cookie['value'], 
                                     domain=cookie.get('domain', ''), path=cookie.get('path', '/')
                                 )
-                            
-                            # Return the HTML from Selenium directly!
-                            # This ensures we don't fail just because requests is still blocked.
                             return self.make_soup(html_source)
                         
                         retries += 1
