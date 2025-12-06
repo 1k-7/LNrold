@@ -3,6 +3,7 @@ import logging
 import time
 import random
 import requests
+import cloudscraper
 from urllib.parse import urlparse, parse_qs 
 from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
@@ -25,23 +26,25 @@ class FanMTLCrawler(Crawler):
         # [TURBO] 60 threads for downloading
         self.init_executor(60) 
         
-        # 1. Setup the RUNNER (Standard Requests)
+        # 1. Setup Standard Requests (Primary)
         self.runner = requests.Session()
         
-        # 2. MATCH BROWSER HEADERS EXACTLY
-        self.runner.headers.update({
+        # 2. Setup Cloudscraper (Secondary)
+        # This handles many Cloudflare challenges natively without a browser
+        self.scraper_sess = cloudscraper.create_scraper(
+            browser={'browser': 'chrome', 'platform': 'linux', 'desktop': True}
+        )
+        
+        # Common Headers
+        headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": "same-origin",
-            "Sec-Fetch-User": "?1",
             "Referer": "https://www.fanmtl.com/"
-        })
+        }
+        self.runner.headers.update(headers)
+        self.scraper_sess.headers.update(headers)
         
         # Optimize connection pool
         adapter = requests.adapters.HTTPAdapter(pool_connections=60, pool_maxsize=60)
@@ -50,26 +53,27 @@ class FanMTLCrawler(Crawler):
 
         self.scraper = self.runner
         self.cleaner.bad_css.update({'div[align="center"]'})
-        logger.info("FanMTL Strategy: Hybrid (Requests + Humanized Selenium Fallback)")
+        logger.info("FanMTL Strategy: Requests -> Cloudscraper -> Selenium (Triple Fallback)")
 
     def human_click(self, driver, element):
-        """Moves mouse to element with small jitters before clicking."""
+        """Attempts multiple clicking strategies to fool detection."""
         try:
+            # Strategy A: ActionChains (Simulate Mouse)
             action = ActionChains(driver)
-            # Move to random offset to look human
-            x_offset = random.randint(-5, 5)
-            y_offset = random.randint(-5, 5)
-            action.move_to_element_with_offset(element, x_offset, y_offset)
+            action.move_to_element_with_offset(element, random.randint(-3, 3), random.randint(-3, 3))
             action.pause(random.uniform(0.1, 0.3))
             action.click()
             action.perform()
         except Exception:
-            # Fallback to JS click if action chain fails
-            driver.execute_script("arguments[0].click();", element)
+            try:
+                # Strategy B: Direct JS Click
+                driver.execute_script("arguments[0].click();", element)
+            except Exception:
+                pass
 
     def fetch_with_browser(self, url):
         """
-        Launches Selenium with a RETRY LOOP to solve Cloudflare.
+        Launches Selenium with 'New Headless' mode to act as a real browser.
         """
         logger.warning(f"🔒 Launching Browser Solver for: {url}")
         driver = None
@@ -79,13 +83,18 @@ class FanMTLCrawler(Crawler):
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--window-size=1920,1080")
             
-            # Anti-Detection settings
+            # CRITICAL: Use new headless mode (passes detection better)
+            options.add_argument("--headless=new") 
+            
+            # Anti-Detection
             options.add_argument("--disable-blink-features=AutomationControlled")
             options.add_experimental_option("excludeSwitches", ["enable-automation"])
             options.add_experimental_option('useAutomationExtension', False)
             options.add_argument(f"--user-agent={self.runner.headers['User-Agent']}")
             
-            driver = create_local(headless=True, options=options)
+            # We pass headless=False to create_local to prevent it from adding 
+            # the old '--headless' flag, since we added '--headless=new' manually.
+            driver = create_local(headless=False, options=options)
             
             # Patch navigator.webdriver
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
@@ -94,12 +103,10 @@ class FanMTLCrawler(Crawler):
 
             driver.get(url)
             
-            # --- RETRY LOOP FOR SOLVING ---
-            # Attempt to solve up to 3 times if we get stuck
+            # --- RETRY LOOP ---
             for attempt in range(3):
-                time.sleep(3 + attempt) # Wait a bit longer each time
+                time.sleep(4 + attempt)
                 
-                # If we are already through, break!
                 if "Just a moment" not in driver.title:
                     logger.info("Browser: Page loaded successfully!")
                     break
@@ -113,30 +120,24 @@ class FanMTLCrawler(Crawler):
                     )
                     driver.switch_to.frame(iframe)
                     
-                    # Find checkbox
+                    # Find and Click
                     checkbox = WebDriverWait(driver, 5).until(
                         EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='checkbox'], .mark, body"))
                     )
-                    
-                    # Perform Human Click
                     self.human_click(driver, checkbox)
                     
-                    # Switch back and wait
+                    # Switch back
                     driver.switch_to.default_content()
-                    time.sleep(5)
-                except Exception as e:
-                    # If we can't find the frame, maybe we are just waiting for redirect
-                    logger.debug(f"Solver step failed: {e}")
+                except Exception:
                     driver.switch_to.default_content()
 
-            # Final check
+            # Result
             if "Just a moment" in driver.title:
-                logger.error("Browser: Failed to pass challenge after retries.")
+                logger.error("Browser: Failed to pass challenge.")
             
-            # Grab content and cookies
+            # Extract Data
             html = driver.page_source
             cookies = driver.get_cookies()
-            
             return html, cookies
 
         except Exception as e:
@@ -151,24 +152,41 @@ class FanMTLCrawler(Crawler):
         retries = 0
         while True:
             try:
-                # 1. Try Fast Requests
+                # LAYER 1: Standard Requests (Fast)
                 req_headers = self.runner.headers.copy()
                 if headers: req_headers.update(headers)
                 
-                response = self.runner.get(url, headers=req_headers, timeout=20)
+                response = self.runner.get(url, headers=req_headers, timeout=15)
                 
-                # 2. Check for Cloudflare Block
+                # Check for Block
                 if response.status_code in [403, 503] or "just a moment" in response.text.lower():
                     if retries == 0:
-                        logger.warning("⛔ Request blocked. Switching to Selenium...")
+                        logger.warning("⛔ Requests blocked. Trying Cloudscraper...")
                         
-                        # 3. Use Browser to fetch content
+                        # LAYER 2: Cloudscraper (Medium)
+                        try:
+                            cf_response = self.scraper_sess.get(url, headers=req_headers, timeout=20)
+                            if cf_response.status_code == 200 and "just a moment" not in cf_response.text.lower():
+                                logger.info("✅ Cloudscraper bypassed protection!")
+                                # Sync cookies to main runner
+                                self.runner.cookies.update(self.scraper_sess.cookies)
+                                return self.make_soup(cf_response)
+                        except Exception as cfe:
+                            logger.warning(f"Cloudscraper failed: {cfe}")
+
+                        # LAYER 3: Selenium (Slow Fallback)
+                        logger.warning("⛔ Cloudscraper failed. Switching to Selenium...")
                         html_source, cookies = self.fetch_with_browser(url)
                         
                         if html_source and cookies:
-                            # Update requests session with new cookies
+                            # Sync cookies
                             for cookie in cookies:
                                 self.runner.cookies.set(
+                                    cookie['name'], cookie['value'], 
+                                    domain=cookie.get('domain', ''), path=cookie.get('path', '/')
+                                )
+                                # Also update Cloudscraper for future luck
+                                self.scraper_sess.cookies.set(
                                     cookie['name'], cookie['value'], 
                                     domain=cookie.get('domain', ''), path=cookie.get('path', '/')
                                 )
@@ -177,7 +195,7 @@ class FanMTLCrawler(Crawler):
                         retries += 1
                         continue
                     else:
-                        raise Exception("Cloudflare Loop (Browser failed to bypass)")
+                        raise Exception("All bypass methods failed.")
 
                 response.raise_for_status()
                 return self.make_soup(response)
