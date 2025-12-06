@@ -1,16 +1,13 @@
 # -*- coding: utf-8 -*-
 import logging
 import time
+import requests
 from urllib.parse import urlparse, parse_qs 
 from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
 from lncrawl.core.crawler import Crawler
 
-# KEY CHANGE: Use curl_cffi to spoof browser TLS fingerprint
-# This bypasses Cloudflare blocking standard 'requests'
-from curl_cffi import requests
-
-# Import Selenium for fallback solving
+# Import Selenium components
 from lncrawl.webdriver.local import create_local
 from selenium.webdriver import ChromeOptions
 from selenium.webdriver.common.by import By
@@ -27,28 +24,30 @@ class FanMTLCrawler(Crawler):
         # [TURBO] 60 threads for downloading
         self.init_executor(60) 
         
-        # 1. Setup the RUNNER (curl_cffi)
-        # 'impersonate' makes the TLS handshake look exactly like Chrome 120
-        self.runner = requests.Session(impersonate="chrome120")
+        # 1. Setup the RUNNER (Standard Requests)
+        self.runner = requests.Session()
         
+        # Standard headers to mimic a generic browser
         self.runner.headers.update({
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.fanmtl.com/",
             "Upgrade-Insecure-Requests": "1",
-            # User agent is handled automatically by impersonate, but we set a fallback
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         })
+        
+        # Optimize connection pool
+        adapter = requests.adapters.HTTPAdapter(pool_connections=60, pool_maxsize=60)
+        self.runner.mount("https://", adapter)
+        self.runner.mount("http://", adapter)
 
-        # Expose runner to the bot for cover downloading
         self.scraper = self.runner
-
         self.cookies_synced = False
         self.cleaner.bad_css.update({'div[align="center"]'})
-        logger.info("FanMTL Strategy: curl_cffi (TLS Spoofing) -> Selenium Solver (Fallback)")
+        logger.info("FanMTL Strategy: Requests (Fast) -> Selenium Clicker (Solver)")
 
     def refresh_cookies(self, url):
-        """Launches a stealthy headless browser to solve Cloudflare."""
+        """Launches a headless browser to CLICK and SOLVE the Cloudflare Challenge."""
         logger.warning(f"🔒 Launching Browser Solver for: {url}")
         driver = None
         try:
@@ -57,14 +56,15 @@ class FanMTLCrawler(Crawler):
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--window-size=1920,1080")
             
-            # STEALTH: Hide automation flags
+            # Hide automation flags to prevent immediate detection
             options.add_argument("--disable-blink-features=AutomationControlled")
             options.add_experimental_option("excludeSwitches", ["enable-automation"])
             options.add_experimental_option('useAutomationExtension', False)
+            options.add_argument(f"--user-agent={self.runner.headers['User-Agent']}")
             
             driver = create_local(headless=True, options=options)
             
-            # STEALTH: Patch navigator.webdriver to undefined
+            # Patch navigator.webdriver to undefined (Crucial for Cloudflare)
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
                 "source": """
                     Object.defineProperty(navigator, 'webdriver', {
@@ -74,41 +74,43 @@ class FanMTLCrawler(Crawler):
             })
 
             driver.get(url)
-            time.sleep(5)
+            time.sleep(3)
 
-            # --- SOLVER LOGIC ---
+            # --- ACTIVE SOLVER LOGIC ---
+            # This block finds the Cloudflare iframe and CLICKS the checkbox
             try:
-                # 1. Look for Cloudflare Challenge iframe
-                iframe = WebDriverWait(driver, 5).until(
+                # 1. Wait for the Challenge iframe
+                iframe = WebDriverWait(driver, 8).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "iframe[src*='challenge'], iframe[src*='turnstile']"))
                 )
                 if iframe:
                     logger.info("Browser: Found Cloudflare challenge. Attempting click...")
                     driver.switch_to.frame(iframe)
                     
-                    # 2. Click logic
+                    # 2. Click the verification box (or body if specific element is hidden)
                     checkbox = WebDriverWait(driver, 5).until(
                         EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='checkbox'], .mark, body"))
                     )
                     driver.execute_script("arguments[0].click();", checkbox)
                     
+                    # 3. Switch back to main content and wait for reload
                     driver.switch_to.default_content()
-                    time.sleep(5)
+                    time.sleep(6)
             except Exception:
+                # Sometimes it auto-solves or just needs time
                 pass
-            # --------------------
+            # ---------------------------
 
-            # Wait if still stuck
+            # Check if we are still stuck on the challenge page
             if "Just a moment" in driver.title:
                 logger.info("Browser: Waiting for redirect...")
-                time.sleep(10)
+                time.sleep(5)
 
             cookies = driver.get_cookies()
             ua = driver.execute_script("return navigator.userAgent")
             
             found_cf = False
             for cookie in cookies:
-                # Convert Selenium cookie to requests/curl_cffi cookie
                 self.runner.cookies.set(
                     cookie['name'], 
                     cookie['value'], 
@@ -122,7 +124,7 @@ class FanMTLCrawler(Crawler):
                 self.runner.headers['User-Agent'] = ua
             
             if found_cf:
-                logger.info("✅ Solver Success! Cookies synced.")
+                logger.info("✅ Solver Success! Cookies synced. Resuming Turbo Mode.")
                 self.cookies_synced = True
             else:
                 logger.warning("⚠️ Browser finished but 'cf_clearance' missing. (Title: %s)", driver.title)
@@ -135,22 +137,24 @@ class FanMTLCrawler(Crawler):
                 except: pass
 
     def get_soup_safe(self, url, headers=None):
-        """Smart wrapper: curl_cffi -> Solver -> Retry"""
+        """Smart wrapper: Requests -> Catch 403 -> Solver -> Retry"""
         retries = 0
         while True:
             try:
-                # STEP 1: Fast Request (TLS Spoofed)
-                response = self.runner.get(url, headers=headers, timeout=20)
+                req_headers = self.runner.headers.copy()
+                if headers: req_headers.update(headers)
+
+                # Standard Request
+                response = self.runner.get(url, headers=req_headers, timeout=20)
                 
-                # Check for Challenge Page
+                # Check for Cloudflare Challenge Page
                 if response.status_code in [403, 503] and ("just a moment" in response.text.lower() or "challenge" in response.text.lower()):
                     if retries == 0:
-                        logger.warning("⛔ Access blocked (403/503). Activating Solver...")
+                        logger.warning("⛔ Access blocked. Activating Solver...")
                         self.refresh_cookies(url)
                         retries += 1
                         continue
                     else:
-                        # If we still fail after solving, the IP might be dirty
                         raise Exception("Cloudflare Loop (Solver failed)")
 
                 response.raise_for_status()
@@ -162,7 +166,14 @@ class FanMTLCrawler(Crawler):
                     logger.error(f"Permanent Error (404): {url}")
                     return self.make_soup("<html></html>")
 
+                # Catch-all for network errors, try solving once if we haven't yet
                 if retries < 2:
+                    # If it's a connection error, maybe the IP is temporarily blocked, 
+                    # trying the solver might refresh the session.
+                    if retries == 0 and "connection" in msg:
+                         logger.warning("Connection issue. Trying solver just in case...")
+                         self.refresh_cookies(url)
+                    
                     logger.warning(f"Request Error: {e}. Retrying...")
                     time.sleep(2)
                     retries += 1
@@ -212,7 +223,6 @@ class FanMTLCrawler(Crawler):
                 page_count = int(page_params[0]) + 1
                 wjm = query.get("wjm", [""])[0]
                 
-                # Headers for AJAX pagination
                 ajax_headers = {"X-Requested-With": "XMLHttpRequest"}
 
                 for page in range(page_count):
