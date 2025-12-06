@@ -31,13 +31,6 @@ class FanMTLCrawler(Crawler):
             "Upgrade-Insecure-Requests": "1",
         })
         
-        # Force traffic through WARP (socks5h = Remote DNS resolution)
-        self.proxy_url = "socks5h://127.0.0.1:40000"
-        self.runner.proxies = {
-            "http": self.proxy_url,
-            "https": self.proxy_url
-        }
-
         # Optimize connection pool
         adapter = requests.adapters.HTTPAdapter(pool_connections=60, pool_maxsize=60)
         self.runner.mount("https://", adapter)
@@ -58,7 +51,6 @@ class FanMTLCrawler(Crawler):
             options = ChromeOptions()
             options.add_argument("--no-sandbox") 
             options.add_argument("--disable-dev-shm-usage")
-            options.add_argument(f'--proxy-server={self.proxy_url}')
             
             driver = create_local(headless=True, options=options)
             
