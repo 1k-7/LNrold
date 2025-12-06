@@ -7,7 +7,7 @@ from bs4 import BeautifulSoup
 from lncrawl.models import Chapter
 from lncrawl.core.crawler import Crawler
 
-# Import Selenium components
+# Import Selenium
 from lncrawl.webdriver.local import create_local
 from selenium.webdriver import ChromeOptions
 from selenium.webdriver.common.by import By
@@ -27,13 +27,23 @@ class FanMTLCrawler(Crawler):
         # 1. Setup the RUNNER (Standard Requests)
         self.runner = requests.Session()
         
-        # Standard headers to mimic a generic browser
+        # 2. MATCH BROWSER HEADERS EXACTLY
+        # This helps 'requests' look like the Selenium browser
         self.runner.headers.update({
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.fanmtl.com/",
+            "Accept-Encoding": "gzip, deflate, br",
+            "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
+            "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Linux"',
+            "Referer": "https://www.fanmtl.com/"
         })
         
         # Optimize connection pool
@@ -42,12 +52,16 @@ class FanMTLCrawler(Crawler):
         self.runner.mount("http://", adapter)
 
         self.scraper = self.runner
-        self.cookies_synced = False
         self.cleaner.bad_css.update({'div[align="center"]'})
-        logger.info("FanMTL Strategy: Requests (Fast) -> Selenium Clicker (Solver)")
+        logger.info("FanMTL Strategy: Hybrid (Requests + Selenium Content Fallback)")
 
-    def refresh_cookies(self, url):
-        """Launches a headless browser to CLICK and SOLVE the Cloudflare Challenge."""
+    def fetch_with_browser(self, url):
+        """
+        Launches Selenium to:
+        1. Access the URL
+        2. Solve Cloudflare (Click)
+        3. Return the VALID HTML and COOKIES
+        """
         logger.warning(f"🔒 Launching Browser Solver for: {url}")
         driver = None
         try:
@@ -56,7 +70,7 @@ class FanMTLCrawler(Crawler):
             options.add_argument("--disable-dev-shm-usage")
             options.add_argument("--window-size=1920,1080")
             
-            # Hide automation flags to prevent immediate detection
+            # Anti-Detection settings
             options.add_argument("--disable-blink-features=AutomationControlled")
             options.add_experimental_option("excludeSwitches", ["enable-automation"])
             options.add_experimental_option('useAutomationExtension', False)
@@ -64,122 +78,104 @@ class FanMTLCrawler(Crawler):
             
             driver = create_local(headless=True, options=options)
             
-            # Patch navigator.webdriver to undefined (Crucial for Cloudflare)
+            # Patch navigator.webdriver
             driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
-                "source": """
-                    Object.defineProperty(navigator, 'webdriver', {
-                        get: () => undefined
-                    })
-                """
+                "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
             })
 
             driver.get(url)
             time.sleep(3)
 
-            # --- ACTIVE SOLVER LOGIC ---
-            # This block finds the Cloudflare iframe and CLICKS the checkbox
+            # --- CLICKER LOGIC ---
             try:
-                # 1. Wait for the Challenge iframe
-                iframe = WebDriverWait(driver, 8).until(
+                # Wait for Cloudflare Challenge
+                iframe = WebDriverWait(driver, 5).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "iframe[src*='challenge'], iframe[src*='turnstile']"))
                 )
                 if iframe:
-                    logger.info("Browser: Found Cloudflare challenge. Attempting click...")
+                    logger.info("Browser: Found challenge iframe. Clicking...")
                     driver.switch_to.frame(iframe)
-                    
-                    # 2. Click the verification box (or body if specific element is hidden)
                     checkbox = WebDriverWait(driver, 5).until(
                         EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='checkbox'], .mark, body"))
                     )
                     driver.execute_script("arguments[0].click();", checkbox)
-                    
-                    # 3. Switch back to main content and wait for reload
                     driver.switch_to.default_content()
-                    time.sleep(6)
+                    time.sleep(5)
             except Exception:
-                # Sometimes it auto-solves or just needs time
+                # Might trigger if no iframe found (already passed or different block)
                 pass
-            # ---------------------------
-
-            # Check if we are still stuck on the challenge page
+            
+            # Wait for redirect if still on challenge page
             if "Just a moment" in driver.title:
                 logger.info("Browser: Waiting for redirect...")
-                time.sleep(5)
+                time.sleep(10)
 
+            # Grab content and cookies
+            html = driver.page_source
             cookies = driver.get_cookies()
-            ua = driver.execute_script("return navigator.userAgent")
             
-            found_cf = False
-            for cookie in cookies:
-                self.runner.cookies.set(
-                    cookie['name'], 
-                    cookie['value'], 
-                    domain=cookie.get('domain', ''),
-                    path=cookie.get('path', '/')
-                )
-                if cookie['name'] == 'cf_clearance':
-                    found_cf = True
-            
-            if ua:
-                self.runner.headers['User-Agent'] = ua
-            
-            if found_cf:
-                logger.info("✅ Solver Success! Cookies synced. Resuming Turbo Mode.")
-                self.cookies_synced = True
-            else:
-                logger.warning("⚠️ Browser finished but 'cf_clearance' missing. (Title: %s)", driver.title)
-            
+            return html, cookies
+
         except Exception as e:
-            logger.critical(f"❌ Browser Solver Failed: {e}")
+            logger.critical(f"❌ Browser Failed: {e}")
+            return None, None
         finally:
             if driver:
                 try: driver.quit()
                 except: pass
 
     def get_soup_safe(self, url, headers=None):
-        """Smart wrapper: Requests -> Catch 403 -> Solver -> Retry"""
+        """
+        Tries Requests. If blocked, uses Selenium to get the HTML directly.
+        """
         retries = 0
         while True:
             try:
+                # 1. Try Fast Requests
                 req_headers = self.runner.headers.copy()
                 if headers: req_headers.update(headers)
-
-                # Standard Request
+                
                 response = self.runner.get(url, headers=req_headers, timeout=20)
                 
-                # Check for Cloudflare Challenge Page
-                if response.status_code in [403, 503] and ("just a moment" in response.text.lower() or "challenge" in response.text.lower()):
+                # 2. Check for Cloudflare Block
+                if response.status_code in [403, 503] or "just a moment" in response.text.lower():
                     if retries == 0:
-                        logger.warning("⛔ Access blocked. Activating Solver...")
-                        self.refresh_cookies(url)
+                        logger.warning("⛔ Request blocked. Switching to Selenium...")
+                        
+                        # 3. Use Browser to fetch content
+                        html_source, cookies = self.fetch_with_browser(url)
+                        
+                        if html_source and cookies:
+                            # Update requests session with new cookies
+                            for cookie in cookies:
+                                self.runner.cookies.set(
+                                    cookie['name'], cookie['value'], 
+                                    domain=cookie.get('domain', ''), path=cookie.get('path', '/')
+                                )
+                            
+                            # Return the HTML from Selenium directly!
+                            # This ensures we don't fail just because requests is still blocked.
+                            return self.make_soup(html_source)
+                        
                         retries += 1
                         continue
                     else:
-                        raise Exception("Cloudflare Loop (Solver failed)")
+                        raise Exception("Cloudflare Loop (Browser failed to bypass)")
 
                 response.raise_for_status()
                 return self.make_soup(response)
 
             except Exception as e:
-                msg = str(e).lower()
-                if "404" in msg:
-                    logger.error(f"Permanent Error (404): {url}")
+                if "404" in str(e):
                     return self.make_soup("<html></html>")
-
-                # Catch-all for network errors, try solving once if we haven't yet
+                
                 if retries < 2:
-                    # If it's a connection error, maybe the IP is temporarily blocked, 
-                    # trying the solver might refresh the session.
-                    if retries == 0 and "connection" in msg:
-                         logger.warning("Connection issue. Trying solver just in case...")
-                         self.refresh_cookies(url)
-                    
-                    logger.warning(f"Request Error: {e}. Retrying...")
+                    logger.warning(f"Fetch error: {e}. Retrying...")
                     time.sleep(2)
                     retries += 1
                     continue
                 
-                logger.error(f"Failed to fetch {url} after retries.")
+                logger.error(f"Failed to fetch {url}")
                 return self.make_soup("<html></html>")
 
     def read_novel_info(self):
